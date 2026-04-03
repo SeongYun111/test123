@@ -1,0 +1,308 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+from xgboost import XGBClassifier
+import re
+import urllib.parse
+import tldextract
+import joblib
+import warnings
+from collections import Counter
+
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+# ============================================
+# 1. URL 정규화 함수
+# ============================================
+def normalize_url(url):
+    url = str(url).strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+    return url
+
+# ============================================
+# 2. 등록 도메인 추출 함수
+# ============================================
+def get_registered_domain(url):
+    try:
+        ext = tldextract.extract(url)
+        return ext.top_domain_under_public_suffix
+    except:
+        return ''
+
+# ============================================
+# 3. 피처 추출 함수
+# ============================================
+def extract_features(url):
+    try:
+        url = normalize_url(url)
+        parsed = urllib.parse.urlparse(url)
+        ext = tldextract.extract(url)
+
+        registered_domain = ext.top_domain_under_public_suffix
+        subdomain = ext.subdomain
+        full_domain = parsed.netloc
+        path = parsed.path
+
+        trusted_registered = [
+            'google.com', 'youtube.com', 'naver.com', 'kakao.com',
+            'daum.net', 'samsung.com', 'microsoft.com', 'apple.com',
+            'facebook.com', 'instagram.com', 'twitter.com', 'github.com',
+            'wikipedia.org', 'netflix.com', 'amazon.com', 'linkedin.com',
+        ]
+        is_trusted = 1 if registered_domain in trusted_registered else 0
+
+        spoofing = 1 if any(
+            td.split('.')[0] in subdomain for td in trusted_registered
+        ) else 0
+
+        features = {
+            'url_length': len(url),
+            'domain_length': len(full_domain),
+            'registered_domain_length': len(registered_domain),
+            'path_length': len(path),
+            'num_dots': url.count('.'),
+            'num_hyphens': url.count('-'),
+            'num_underscores': url.count('_'),
+            'num_slashes': url.count('/'),
+            'num_at': url.count('@'),
+            'num_question': url.count('?'),
+            'num_equals': url.count('='),
+            'num_ampersand': url.count('&'),
+            'num_percent': url.count('%'),
+            'has_https': 1 if parsed.scheme == 'https' else 0,
+            'has_ip': 1 if re.match(r'\d+\.\d+\.\d+\.\d+', full_domain) else 0,
+            'num_subdomains': len(subdomain.split('.')) if subdomain else 0,
+            'has_port': 1 if ':' in full_domain else 0,
+            'has_suspicious_keyword': 1 if any(
+                kw in url.lower() for kw in [
+                    'login', 'secure', 'account', 'update', 'bank',
+                    'verify', 'password', 'confirm', 'signin', 'free',
+                    'lucky', 'prize', 'win', 'click', 'urgent'
+                ]
+            ) else 0,
+            'is_shortened': 1 if registered_domain in [
+                'bit.ly', 'tinyurl.com', 'goo.gl', 't.co', 'short.io'
+            ] else 0,
+            'digit_ratio': sum(c.isdigit() for c in url) / len(url) if url else 0,
+            'is_trusted_domain': is_trusted,
+            'is_spoofing': spoofing,
+            'domain_has_digit': 1 if re.search(r'\d', registered_domain) else 0,
+            'domain_has_hyphen': 1 if '-' in registered_domain else 0,
+            'tld_suspicious': 1 if any(
+                registered_domain.endswith(tld) for tld in [
+                    '.click', '.xyz', '.top', '.pw', '.tk', '.ml', '.ga', '.cf', '.gq'
+                ]
+            ) else 0,
+        }
+        return features
+    except:
+        return None
+
+# ============================================
+# 4. 데이터셋 1 로드
+# ============================================
+print("데이터셋 1 로드 중...")
+df1 = pd.read_csv('malicious_phish.csv', quoting=1, on_bad_lines='skip')
+print(f"로드 후 전체: {len(df1)}건")
+
+before = len(df1)
+df1 = df1[~df1['url'].str.contains(',', na=False)]
+print(f"콤마 포함 URL 제거: {before - len(df1)}건 제거됨")
+print(f"정제 후: {len(df1)}건")
+print(f"라벨 분포:\n{df1['type'].value_counts()}\n")
+
+label_map1 = {'benign': 0, 'phishing': 1, 'malware': 1, 'defacement': 1}
+df1['label'] = df1['type'].map(label_map1)
+df1 = df1[['url', 'label']].dropna()
+
+# ============================================
+# 5. 데이터셋 2 로드
+# ============================================
+print("데이터셋 2 로드 중...")
+df2 = pd.read_csv('PhiUSIIL_Phishing_URL_Dataset.csv', quoting=1, on_bad_lines='skip')
+df2.columns = df2.columns.str.lower()
+df2 = df2[~df2['url'].str.contains(',', na=False)]
+print(f"정제 후: {len(df2)}건")
+print(f"라벨 분포:\n{df2['label'].value_counts()}\n")
+df2 = df2[['url', 'label']].dropna()
+
+# ============================================
+# 6. 합치기
+# ============================================
+print("데이터셋 합치는 중...")
+df = pd.concat([df1, df2], ignore_index=True)
+df = df.drop_duplicates(subset='url')
+df['label'] = df['label'].astype(int)
+print(f"합친 후 전체: {len(df)}건")
+print(f"라벨 분포:\n{df['label'].value_counts()}\n")
+
+# ============================================
+# 7. 불균형 처리
+# ============================================
+print("불균형 처리 중...")
+df_benign = df[df['label'] == 0]
+df_danger = df[df['label'] == 1]
+print(f"처리 전 - 안전: {len(df_benign)}건, 위험: {len(df_danger)}건")
+
+if len(df_benign) > len(df_danger) * 2:
+    df_benign = df_benign.sample(n=len(df_danger) * 2, random_state=42)
+elif len(df_danger) > len(df_benign) * 2:
+    df_danger = df_danger.sample(n=len(df_benign) * 2, random_state=42)
+
+df_balanced = pd.concat([df_benign, df_danger], ignore_index=True)
+df_balanced = df_balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+print(f"처리 후 - 안전: {len(df_benign)}건, 위험: {len(df_danger)}건")
+print(f"총 학습 데이터: {len(df_balanced)}건\n")
+
+# ============================================
+# 8. 피처 추출
+# ============================================
+print("피처 추출 중...")
+features_list = []
+labels_list = []
+
+for i, row in df_balanced.iterrows():
+    feat = extract_features(row['url'])
+    if feat is not None:
+        features_list.append(feat)
+        labels_list.append(row['label'])
+    if len(features_list) % 10000 == 0 and len(features_list) > 0:
+        print(f"  {len(features_list)}건 처리 완료...")
+
+X = pd.DataFrame(features_list)
+y = np.array(labels_list)
+print(f"피처 추출 완료: {len(X)}건\n")
+
+# ============================================
+# 9. 학습/테스트 분리
+# ============================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+print(f"학습 데이터: {len(X_train)}건, 테스트 데이터: {len(X_test)}건\n")
+
+# ============================================
+# 10. XGBoost 학습
+# ============================================
+print("XGBoost 학습 중...")
+counter = Counter(y_train)
+scale = counter[0] / counter[1] if counter[1] > 0 else 1
+print(f"클래스 가중치 scale_pos_weight: {scale:.2f}\n")
+
+model = XGBClassifier(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.1,
+    scale_pos_weight=scale,
+    eval_metric='logloss',
+    random_state=42,
+    n_jobs=-1
+)
+
+model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=50)
+
+# ============================================
+# 11. 평가
+# ============================================
+y_pred = model.predict(X_test)
+
+print("\n=== 분류 결과 ===")
+print(classification_report(y_test, y_pred, target_names=['안전(0)', '위험(1)']))
+
+print("=== 혼동 행렬 ===")
+cm = confusion_matrix(y_test, y_pred)
+print(cm)
+print(f"\n미탐(위험→안전 오판): {cm[1][0]}건 ({cm[1][0]/cm[1].sum()*100:.1f}%)")
+print(f"오탐(안전→위험 오판): {cm[0][1]}건 ({cm[0][1]/cm[0].sum()*100:.1f}%)")
+
+print("\n=== 피처 중요도 Top 10 ===")
+feat_importance = pd.Series(
+    model.feature_importances_, index=X.columns
+).sort_values(ascending=False)
+print(feat_importance.head(10))
+
+# ============================================
+# 12. 모델 저장
+# ============================================
+joblib.dump(model, 'url_xgboost_model.pkl')
+print("\n모델 저장 완료: url_xgboost_model.pkl")
+
+# ============================================
+# 13. 신뢰/의심 도메인 목록
+# ============================================
+TRUSTED_DOMAINS = [
+    'google.com', 'youtube.com', 'naver.com', 'kakao.com',
+    'daum.net', 'samsung.com', 'microsoft.com', 'apple.com',
+    'facebook.com', 'instagram.com', 'twitter.com', 'github.com',
+    'wikipedia.org', 'netflix.com', 'amazon.com', 'linkedin.com',
+]
+
+SUSPICIOUS_TLDS = [
+    '.click', '.xyz', '.top', '.pw', '.tk', '.ml', '.ga', '.cf', '.gq'
+]
+
+# ============================================
+# 14. 추론 함수
+# ============================================
+def predict_url(url, model):
+    url = normalize_url(url)
+    registered = get_registered_domain(url)
+    feat = extract_features(url)
+
+    if feat is None:
+        print(f"URL: {url}\n판정: 분석 불가\n")
+        return
+
+    feat_df = pd.DataFrame([feat])
+    proba = model.predict_proba(feat_df)[0]
+    danger_prob = proba[1]
+
+    # ── 규칙 1: 사칭 도메인 → 무조건 위험 ──
+    if feat['is_spoofing'] == 1:
+        danger_prob = max(danger_prob, 0.95)
+
+    # ── 규칙 2: 의심 TLD + 의심 키워드 → 위험 ──
+    if feat['tld_suspicious'] == 1 and feat['has_suspicious_keyword'] == 1:
+        danger_prob = max(danger_prob, 0.85)
+
+    # ── 규칙 3: 의심 TLD만 있어도 주의 이상 ──
+    if feat['tld_suspicious'] == 1:
+        danger_prob = max(danger_prob, 0.45)
+
+    # ── 규칙 4: IP 직접 접근 → 위험 ──
+    if feat['has_ip'] == 1:
+        danger_prob = max(danger_prob, 0.85)
+
+    # ── 규칙 5: 신뢰 도메인 + 사칭 없음 + 의심 키워드 없음 → 확률 보정 ──
+    if (registered in TRUSTED_DOMAINS
+            and feat['is_spoofing'] == 0
+            and feat['has_suspicious_keyword'] == 0):
+        danger_prob = danger_prob * 0.1
+
+    if danger_prob >= 0.7:
+        result = '🔴 위험'
+    elif danger_prob >= 0.4:
+        result = '🟡 주의'
+    else:
+        result = '🟢 안전'
+
+    print(f"URL: {url}")
+    print(f"판정: {result}")
+    print(f"위험 확률: {danger_prob:.2%}\n")
+
+# ============================================
+# 15. 추론 테스트
+# ============================================
+print("\n=== 추론 테스트 ===")
+loaded_model = joblib.load('url_xgboost_model.pkl')
+predict_url("https://www.google.com", loaded_model)
+predict_url("http://192.168.1.1/login/secure/bank", loaded_model)
+predict_url("https://bit.ly/3xAb1c2", loaded_model)
+predict_url("http://free-prize-win.click/account/verify", loaded_model)
+predict_url("https://www.naver.com", loaded_model)
+predict_url("http://naver.com.fake-login.xyz/account", loaded_model)
+predict_url("https://docs.google.com/spreadsheets/d/abc123", loaded_model)
+predict_url("http://drive-google-com.fanalav.com/fake", loaded_model)
+predict_url("https://google.com.phishing-site.tk/login/verify", loaded_model)
